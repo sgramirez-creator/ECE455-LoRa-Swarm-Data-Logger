@@ -1,5 +1,8 @@
 #include "LoRaLink.h"
 #include "config.h"
+
+#if TRANSPORT_LORA_P2P
+
 #include <Arduino.h>
 #include <RadioLib.h>
 
@@ -81,3 +84,5 @@ void poll() {
 }
 
 }  // namespace loralink
+
+#endif  // TRANSPORT_LORA_P2P

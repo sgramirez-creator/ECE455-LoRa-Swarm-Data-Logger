@@ -20,6 +20,9 @@ void safetyLight(bool on);
 // Battery pack voltage via the on-board divider, in volts. NaN if unavailable.
 float batteryVolts();
 
+// Solar-panel voltage (SOLAR_ADC_PIN), in volts. NaN if disabled.
+float solarVolts();
+
 void printBanner();
 
 }  // namespace board

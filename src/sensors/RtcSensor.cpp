@@ -39,8 +39,22 @@ void RtcSensor::syncTo(uint32_t epoch, uint32_t toleranceS) {
     }
 }
 
-void RtcSensor::armPeriodicAlarm(uint16_t minutes) {
-    if (!ok_) return;
-    // TODO(phase3): translate `minutes` into an RV-3028 alarm and enable INT.
-    (void)minutes;
+void RtcSensor::armPeriodicTimer(uint32_t seconds) {
+    if (!ok_ || seconds == 0) return;
+    // RV-3028 countdown value is 12-bit. Use the 1 Hz clock for <= 4095 s,
+    // otherwise the 1/60 Hz clock and a value in minutes.
+    if (seconds <= 4095) {
+        dev_.setTimer(/*repeat=*/true, /*frequency=*/1, (uint16_t)seconds,
+                      /*setInterrupt=*/true, /*start=*/true);
+    } else {
+        uint16_t minutes = (uint16_t)((seconds + 59) / 60);
+        if (minutes > 4095) minutes = 4095;
+        dev_.setTimer(true, 60000, minutes, true, true);
+    }
+    Serial.printf("  [rtc] periodic wake timer armed: %lu s\n",
+                  (unsigned long)seconds);
+}
+
+void RtcSensor::clearTimerFlag() {
+    if (ok_) dev_.clearTimerInterruptFlag();
 }

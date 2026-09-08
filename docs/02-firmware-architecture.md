@@ -21,7 +21,10 @@ include/
   board.h               LEDs, safety light, battery sense, boot banner
   scheduler.h           fixed-interval cycle trigger (millis now; RTC-alarm later)
   DataLog.h             append-only CSV log on LittleFS (internal flash)
-  LoRaLink.h            SX1262 P2P transport (bench transport + non-Meshtastic fallback)
+  MeshLink.h            Meshtastic Serial-Module bridge (default transport)
+  LoRaLink.h            SX1262 P2P transport (bench / TRANSPORT_LORA_P2P only)
+  Validator.h           plausibility gates run on each completed record
+  PowerManager.h        sensor-rail switching + sleep/wake (RTC-timer wake)
   Rs485Bus.h            shared half-duplex RS485/Modbus UART (RAK5802)
   sensors/
     ISensor.h           abstract sensor driver interface (ModularSensors-style)
@@ -91,14 +94,21 @@ pio run -t upload        # drag-and-drop UF2, or 1200bps-touch auto-reset
 pio device monitor       # 115200
 ```
 
-## Phase 2 status — sensor integration ✅ (builds; hardware-pending)
+## Phase 2 status — sensor integration ✅
 
-All eight line items implemented as `ISensor` drivers with boot-time presence
-detection. Details + the assumptions to verify: [03-phase2-sensors.md](03-phase2-sensors.md).
+Eight `ISensor` drivers with boot-time presence detection —
+[03-phase2-sensors.md](03-phase2-sensors.md).
 
-## Next (Phase 3)
+## Phase 3 status — embedded system ✅ (sleep partial)
 
-1. Decide Meshtastic vs LoRaWAN vs P2P (blocks the real transport implementation).
-2. `data validation` layer between `SensorManager.sample()` and `datalog::append()` (range/rate checks → `TELEMETRY_FLAG_*`).
-3. RTC-alarm deep sleep in the scheduler; measure the power budget against the 6–7 month goal.
-4. Switched power rails for GNSS / RS485 / sonde.
+Transport = **Meshtastic**, companion-bridge. Data validation, schema-v3
+telemetry, epoch-aligned scheduler, RTC-timer wake. Deep-sleep to µA on RP2040
+is the open item. Details: [04-phase3-embedded.md](04-phase3-embedded.md),
+node setup: [05-meshtastic-node-config.md](05-meshtastic-node-config.md).
+
+## Next (Phase 4 — Meshtastic bring-up & range)
+
+1. Flash stock Meshtastic on the RAK11310, wire + configure the Serial Module.
+2. Stand up the gateway → MQTT → Node-RED → InfluxDB → Grafana path (beegee-tokyo).
+3. Node-to-node, multi-hop, range + packet-loss tests (`seq`/`id` give loss stats).
+4. Close the power budget; decide RP2040 vs nRF52 companion.

@@ -4,8 +4,9 @@
 #include "board.h"
 #include "scheduler.h"
 #include "telemetry.h"
+#include "Validator.h"
+#include "PowerManager.h"
 #include "DataLog.h"
-#include "LoRaLink.h"
 #include "sensors/SensorManager.h"
 #include "sensors/RtcSensor.h"
 #include "sensors/BME680Sensor.h"
@@ -15,12 +16,17 @@
 #include "sensors/WeatherStation.h"
 #include "sensors/RainGauge.h"
 
+#if TRANSPORT_MESHTASTIC
+#include "MeshLink.h"
+#endif
+#if TRANSPORT_LORA_P2P
+#include "LoRaLink.h"
+#endif
+
 // ---- Subsystems -----------------------------------------------------------
 static Scheduler      schedule(MEASUREMENT_INTERVAL_MS);
 static SensorManager  sensors;
 
-// Registration order defines sampling order: RTC first (time), then GNSS can
-// override with satellite time, then the environmental / water sensors.
 static RtcSensor      rtc;
 static BME680Sensor   bme680;
 static GNSSSensor     gnss;
@@ -29,39 +35,62 @@ static ModbusSonde    sonde;
 static WeatherStation weather;
 static RainGauge      rain;
 
-static bool radioReady = false;
+static uint16_t g_seq = 0;
+static bool     uplinkReady = false;
+
+// ---- Time source --------------------------------------------------------
+static uint32_t nowEpoch() {
+#if FEATURE_RTC
+    uint32_t e = rtc.epoch();
+    if (e >= 1672531200UL) return e;
+#endif
+    return 0;   // 0 => scheduler runs free-running on millis()
+}
 
 // ---- One measurement cycle ----------------------------------------------
 static void runMeasurementCycle() {
     board::statusLed(true);
+    power::sensorRail(true);
 
     TelemetryRecord rec;
     telemetry_clear(rec);
     rec.node_id  = NODE_ID;
+    rec.seq      = g_seq++;
     rec.uptime_s = millis() / 1000UL;
     rec.battery_v = board::batteryVolts();
-    if (!isnan(rec.battery_v) && rec.battery_v < 3.4f)
+    rec.solar_v   = board::solarVolts();
+
+    bool critical = !isnan(rec.battery_v) && rec.battery_v < BATTERY_CRITICAL_V;
+    if (!isnan(rec.battery_v) && rec.battery_v < BATTERY_LOW_V)
         rec.flags |= TELEMETRY_FLAG_LOW_BATTERY;
 
     sensors.sample(rec);
 
-    // Discipline the RTC from GNSS time when we have it.
 #if FEATURE_RTC && FEATURE_GNSS
     if (gnss.lastEpoch()) rtc.syncTo(gnss.lastEpoch());
 #endif
 
+    validate::check(rec);
+
     char line[512];
     telemetry_to_csv(rec, line, sizeof(line));
-    Serial.printf("[cycle %lu] %s\n", schedule.cycleCount(), line);
+    Serial.printf("[cycle %lu seq %u] %s\n",
+                  schedule.cycleCount(), rec.seq, line);
 
 #if FEATURE_DATALOG
     datalog::rotateIfNeeded();
     if (!datalog::append(rec)) rec.flags |= TELEMETRY_FLAG_SD_ERROR;
 #endif
 
-#if FEATURE_RADIO
-    if (radioReady) loralink::sendRecord(rec);
+    if (critical) {
+        Serial.println(F("  [power] battery critical -> logged only, no transmit"));
+    } else if (uplinkReady) {
+#if TRANSPORT_MESHTASTIC
+        meshlink::sendRecord(rec);
+#elif TRANSPORT_LORA_P2P
+        loralink::sendRecord(rec);
 #endif
+    }
 
     board::statusLed(false);
 }
@@ -106,9 +135,17 @@ void setup() {
     datalog::begin();
 #endif
 
-#if FEATURE_RADIO
-    Serial.println(F("[init] radio"));
-    radioReady = loralink::begin();
+    power::begin();
+
+    Serial.println(F("[init] transport"));
+#if TRANSPORT_MESHTASTIC
+    uplinkReady = meshlink::begin();
+#elif TRANSPORT_LORA_P2P
+    uplinkReady = loralink::begin();
+#endif
+
+#if FEATURE_RTC
+    rtc.armPeriodicTimer(MEASUREMENT_INTERVAL_MS / 1000UL);
 #endif
 
 #if FEATURE_SAFETY_LIGHT
@@ -120,24 +157,30 @@ void setup() {
 }
 
 void loop() {
-#if FEATURE_RADIO
-    if (radioReady) loralink::poll();
-#endif
-
+#if TRANSPORT_LORA_P2P
+    if (uplinkReady) loralink::poll();
 #if FEATURE_LORA_SMOKETEST
-    // Bench bring-up: transmit an identifying beacon on a fast cadence so a
-    // second node / SDR can confirm the RF path before real telemetry exists.
     static uint32_t nextHello = 0;
-    if (radioReady && (int32_t)(millis() - nextHello) >= 0) {
+    if (uplinkReady && (int32_t)(millis() - nextHello) >= 0) {
         static uint32_t seq = 0;
         loralink::sendHello(seq++);
         board::commsLed(true); delay(5); board::commsLed(false);
         nextHello = millis() + LORA_SMOKETEST_INTERVAL_MS;
     }
 #endif
+#endif
 
-    if (schedule.due()) runMeasurementCycle();
+    if (schedule.due(nowEpoch())) runMeasurementCycle();
 
-    // Phase 3: replace with RTC-alarm deep sleep for schedule.msUntilNext().
+#if FEATURE_SLEEP && !(TRANSPORT_LORA_P2P && FEATURE_LORA_SMOKETEST)
+    uint32_t ms = schedule.msUntilNext(nowEpoch());
+    if (ms > 3000) {
+        uint32_t slept = power::sleepUntilWake(rtc, ms - 1000);
+        Serial.printf("[sleep] %lu ms\n", (unsigned long)slept);
+    } else {
+        delay(20);
+    }
+#else
     delay(20);
+#endif
 }

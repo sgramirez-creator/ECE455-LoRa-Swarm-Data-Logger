@@ -18,9 +18,14 @@ public:
     void syncTo(uint32_t epoch, uint32_t toleranceS = 2);
 
     uint32_t epoch();
+    bool present() const { return ok_; }
 
-    // Program the periodic alarm used for deep-sleep wake-ups (Phase 3).
-    void armPeriodicAlarm(uint16_t minutes);
+    // Program the RV-3028 periodic countdown timer to pull INT low every
+    // `seconds`, auto-reloading. This is the deep-sleep wake source.
+    void armPeriodicTimer(uint32_t seconds);
+
+    // Acknowledge the timer interrupt (call after each wake).
+    void clearTimerFlag();
 
 private:
     RV3028 dev_;

@@ -46,6 +46,17 @@ float batteryVolts() {
     return v_adc * BATTERY_DIVIDER_RATIO;
 }
 
+float solarVolts() {
+#if SOLAR_ADC_PIN >= 0
+    int counts = analogRead(SOLAR_ADC_PIN);
+    if (counts < 0) return NAN;
+    float v_adc = (counts / BATTERY_ADC_MAX_COUNTS) * BATTERY_ADC_REF_V;
+    return v_adc * SOLAR_DIVIDER_RATIO;
+#else
+    return NAN;
+#endif
+}
+
 void printBanner() {
     Serial.println();
     Serial.println(F("=========================================="));

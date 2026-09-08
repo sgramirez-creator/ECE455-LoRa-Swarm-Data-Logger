@@ -11,7 +11,7 @@
 // firmware revision. Add fields at the END and bump TELEMETRY_SCHEMA_VERSION.
 //
 
-#define TELEMETRY_SCHEMA_VERSION  2
+#define TELEMETRY_SCHEMA_VERSION  3
 
 // Sentinel written into any field a sensor could not produce this cycle.
 #define TELEMETRY_NAN             NAN
@@ -23,6 +23,7 @@
 struct TelemetryRecord {
     uint8_t  schema_version;   // == TELEMETRY_SCHEMA_VERSION
     uint16_t node_id;
+    uint16_t seq;              // cycle counter, wraps — for packet-loss stats
     uint32_t uptime_s;         // seconds since boot
     uint32_t epoch_s;          // UTC from RTC/GNSS, 0 if unknown
 
@@ -91,3 +92,8 @@ int telemetry_to_csv(const TelemetryRecord& r, char* buf, int buflen);
 
 // CSV header matching telemetry_to_csv(), for a fresh log file.
 const char* telemetry_csv_header();
+
+// Compact JSON with short keys; NaN fields are omitted. This is the mesh wire
+// format (kept well under Meshtastic's ~230-byte text payload). buf >= 400.
+// Returns the length written, or -1 if it would overflow buflen.
+int telemetry_to_json(const TelemetryRecord& r, char* buf, int buflen);
