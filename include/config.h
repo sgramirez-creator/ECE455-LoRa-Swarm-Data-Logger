@@ -57,9 +57,63 @@
 #define BATTERY_ADC_MAX_COUNTS 4095.0f
 
 // ---------------------------------------------------------------------------
+// Sensors — Phase 2
+// ---------------------------------------------------------------------------
+// I2C addresses (all on `Wire` = i2c1, GP2/GP3 = WisBlock base sensor slots).
+#define BME680_I2C_ADDR         0x76      // RAK1906; 0x77 on some breakouts
+#define RV3028_I2C_ADDR         0x52      // fixed for RV-3028-C7 (RAK12002)
+#define UBLOX_I2C_ADDR          0x42      // RAK12500 default
+
+// --- DS18B20 temperature string (1-Wire) ---
+#define TEMP_STRING_ONEWIRE_PIN     WB_IO6
+#define TEMP_STRING_RESOLUTION_BITS 12
+// Sensors are reported in discovery order. Swap for address-sorted order once
+// the physical top-to-bottom addresses are known (see docs/03-phase2-sensors.md).
+
+// --- Tipping-bucket rain gauge (reed switch to GND) ---
+#define RAIN_GAUGE_PIN         WB_IO5
+#define RAIN_MM_PER_TIP        0.2794f   // 0.011" — typical; calibrate per gauge
+#define RAIN_DEBOUNCE_MS       80
+
+// --- RS485 bus (RAK5802) shared by the sonde + weather station ---
+// VERIFY the UART routing and DE pin against the RAK19001 + RAK5802 schematic.
+#define RS485_SERIAL           Serial1   // UART0 GP0/GP1 on RAK11310
+#define RS485_BAUD             9600
+#define RS485_DE_PIN           WB_IO2    // driver-enable / direction control (-1 if auto)
+#define RS485_CONFIG           SERIAL_8N1
+
+// --- Water-quality sonde (Modbus RTU) ---
+// Holding-register map. Each value is a big-endian float32 (2 registers).
+// Set a register to -1 to skip that parameter. ADJUST to your sonde's manual.
+#define SONDE_MODBUS_ID        1
+#define SONDE_REG_TEMP_C       0
+#define SONDE_REG_PH           2
+#define SONDE_REG_DO_MGL       4
+#define SONDE_REG_COND_USCM    6
+#define SONDE_REG_TURB_NTU     8
+#define SONDE_REG_FUNCTION     3         // 3 = holding registers, 4 = input registers
+
+// --- Integrated weather station (Modbus RTU) ---
+#define WX_MODBUS_ID           2
+#define WX_REG_WIND_SPEED_MS   0
+#define WX_REG_WIND_DIR_DEG    2
+#define WX_REG_AIR_TEMP_C      -1        // -1 = rely on the BME680 instead
+#define WX_REG_AIR_RH_PCT      -1
+#define WX_REG_AIR_PRESS_HPA   -1
+#define WX_REG_FUNCTION        3
+
+// ---------------------------------------------------------------------------
 // Feature flags — flip these off to isolate subsystems during bring-up
 // ---------------------------------------------------------------------------
 #define FEATURE_RADIO          1
 #define FEATURE_DATALOG        1
 #define FEATURE_SAFETY_LIGHT   1
 #define FEATURE_LORA_SMOKETEST 1   // periodic hello packet instead of real telemetry
+
+#define FEATURE_BME680         1
+#define FEATURE_RTC            1
+#define FEATURE_GNSS           1
+#define FEATURE_RAIN_GAUGE     1
+#define FEATURE_TEMP_STRING    1
+#define FEATURE_SONDE          1
+#define FEATURE_WEATHER        1

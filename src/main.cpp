@@ -7,15 +7,27 @@
 #include "DataLog.h"
 #include "LoRaLink.h"
 #include "sensors/SensorManager.h"
+#include "sensors/RtcSensor.h"
 #include "sensors/BME680Sensor.h"
 #include "sensors/GNSSSensor.h"
+#include "sensors/TempString.h"
+#include "sensors/ModbusSonde.h"
+#include "sensors/WeatherStation.h"
+#include "sensors/RainGauge.h"
 
 // ---- Subsystems -----------------------------------------------------------
 static Scheduler      schedule(MEASUREMENT_INTERVAL_MS);
 static SensorManager  sensors;
 
+// Registration order defines sampling order: RTC first (time), then GNSS can
+// override with satellite time, then the environmental / water sensors.
+static RtcSensor      rtc;
 static BME680Sensor   bme680;
 static GNSSSensor     gnss;
+static TempString     tempString;
+static ModbusSonde    sonde;
+static WeatherStation weather;
+static RainGauge      rain;
 
 static bool radioReady = false;
 
@@ -28,10 +40,17 @@ static void runMeasurementCycle() {
     rec.node_id  = NODE_ID;
     rec.uptime_s = millis() / 1000UL;
     rec.battery_v = board::batteryVolts();
+    if (!isnan(rec.battery_v) && rec.battery_v < 3.4f)
+        rec.flags |= TELEMETRY_FLAG_LOW_BATTERY;
 
     sensors.sample(rec);
 
-    char line[320];
+    // Discipline the RTC from GNSS time when we have it.
+#if FEATURE_RTC && FEATURE_GNSS
+    if (gnss.lastEpoch()) rtc.syncTo(gnss.lastEpoch());
+#endif
+
+    char line[512];
     telemetry_to_csv(rec, line, sizeof(line));
     Serial.printf("[cycle %lu] %s\n", schedule.cycleCount(), line);
 
@@ -58,8 +77,27 @@ void setup() {
     board::blink(2);
 
     Serial.println(F("[init] sensors"));
+#if FEATURE_RTC
+    sensors.add(&rtc);
+#endif
+#if FEATURE_BME680
     sensors.add(&bme680);
+#endif
+#if FEATURE_GNSS
     sensors.add(&gnss);
+#endif
+#if FEATURE_TEMP_STRING
+    sensors.add(&tempString);
+#endif
+#if FEATURE_SONDE
+    sensors.add(&sonde);
+#endif
+#if FEATURE_WEATHER
+    sensors.add(&weather);
+#endif
+#if FEATURE_RAIN_GAUGE
+    sensors.add(&rain);
+#endif
     int healthy = sensors.begin();
     Serial.printf("[init] %d/%d sensors present\n", healthy, sensors.count());
 

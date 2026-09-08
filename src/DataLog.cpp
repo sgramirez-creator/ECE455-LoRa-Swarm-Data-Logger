@@ -26,7 +26,7 @@ bool begin() {
 
 bool append(const TelemetryRecord& r) {
     if (!mounted) return false;
-    char line[320];
+    char line[512];
     telemetry_to_csv(r, line, sizeof(line));
 
     File f = LittleFS.open(DATALOG_PATH, "a");

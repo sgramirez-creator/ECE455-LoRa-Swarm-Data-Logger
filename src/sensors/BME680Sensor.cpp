@@ -1,22 +1,28 @@
 #include "sensors/BME680Sensor.h"
+#include "config.h"
 #include <Arduino.h>
 
-// TODO(phase2): probe I2C 0x76/0x77 on Wire and init the real driver.
 bool BME680Sensor::begin() {
-#if defined(BME680_STUB_ABSENT)
-    return false;
-#else
-    return true;   // pretend the part is on the bus
-#endif
+    Wire.begin();
+    if (!dev_.begin(BME680_I2C_ADDR)) return false;
+    dev_.setTemperatureOversampling(BME680_OS_8X);
+    dev_.setHumidityOversampling(BME680_OS_2X);
+    dev_.setPressureOversampling(BME680_OS_4X);
+    dev_.setIIRFilterSize(BME680_FILTER_SIZE_3);
+    dev_.setGasHeater(320, 150);   // 320 C for 150 ms
+    return true;
+}
+
+void BME680Sensor::startMeasurement() {
+    uint32_t ready = dev_.beginReading();          // async conversion
+    warmup_ = ready ? (ready - millis() + 20) : 250;
 }
 
 bool BME680Sensor::read(TelemetryRecord& out) {
-    // Synthetic diurnal-ish wander so downstream code sees changing values.
-    float phase = (millis() / 60000.0f);
-    out.air_temp_c        = 21.0f + 3.0f * sinf(phase);
-    out.air_humidity_pct  = 55.0f + 10.0f * cosf(phase);
-    out.air_pressure_hpa  = 1013.2f + 0.5f * sinf(phase / 3.0f);
-    out.gas_resistance_kohm = 120.0f + 5.0f * (float)(reads_ % 7);
-    reads_++;
+    if (!dev_.endReading()) return false;
+    out.air_temp_c          = dev_.temperature;
+    out.air_humidity_pct    = dev_.humidity;
+    out.air_pressure_hpa    = dev_.pressure / 100.0f;
+    out.gas_resistance_kohm = dev_.gas_resistance / 1000.0f;
     return true;
 }

@@ -11,10 +11,13 @@
 // firmware revision. Add fields at the END and bump TELEMETRY_SCHEMA_VERSION.
 //
 
-#define TELEMETRY_SCHEMA_VERSION  1
+#define TELEMETRY_SCHEMA_VERSION  2
 
 // Sentinel written into any field a sensor could not produce this cycle.
 #define TELEMETRY_NAN             NAN
+
+// Max nodes in a DS18B20 temperature profiling string.
+#define TELEMETRY_TEMP_STRING_MAX 8
 
 #pragma pack(push, 1)
 struct TelemetryRecord {
@@ -47,6 +50,10 @@ struct TelemetryRecord {
     float    wind_speed_ms;
     float    wind_dir_deg;
 
+    // Vertical temperature profile (DS18B20 string), shallow -> deep
+    uint8_t  temp_string_count;
+    float    temp_string_c[TELEMETRY_TEMP_STRING_MAX];
+
     // Housekeeping
     float    battery_v;
     float    solar_v;
@@ -74,9 +81,12 @@ inline void telemetry_clear(TelemetryRecord& r) {
     r.water_conductivity_uscm = r.water_turbidity_ntu = TELEMETRY_NAN;
     r.rain_mm = r.wind_speed_ms = r.wind_dir_deg = TELEMETRY_NAN;
     r.battery_v = r.solar_v = TELEMETRY_NAN;
+    r.temp_string_count = 0;
+    for (int i = 0; i < TELEMETRY_TEMP_STRING_MAX; ++i)
+        r.temp_string_c[i] = TELEMETRY_NAN;
 }
 
-// One CSV line (no trailing newline). buf should be >= 320 bytes.
+// One CSV line (no trailing newline). buf should be >= 512 bytes.
 int telemetry_to_csv(const TelemetryRecord& r, char* buf, int buflen);
 
 // CSV header matching telemetry_to_csv(), for a fresh log file.

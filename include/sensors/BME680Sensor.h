@@ -1,21 +1,20 @@
 #pragma once
 #include "sensors/ISensor.h"
+#include <Adafruit_BME680.h>
 
 //
-// RAK1906 / BME680 environmental sensor (I2C on `Wire` = GP2/GP3).
-//
-// STUB: currently synthesises plausible values so the pipeline can be exercised
-// without hardware. Phase 2: replace the body with Adafruit_BME680 or the Bosch
-// BSEC library. Keep begin() returning false when the part does not ACK so the
-// manager correctly marks it absent.
+// RAK1906 / Bosch BME680 — air temperature, humidity, barometric pressure and
+// VOC gas resistance. I2C on `Wire` (GP2/GP3 = WisBlock base sensor slots).
 //
 class BME680Sensor : public ISensor {
 public:
     const char* name() const override { return "BME680"; }
     bool begin() override;
-    uint32_t warmupMs() const override { return 250; }
+    void startMeasurement() override;
+    uint32_t warmupMs() const override { return warmup_; }
     bool read(TelemetryRecord& out) override;
 
 private:
-    uint32_t reads_ = 0;
+    Adafruit_BME680 dev_{&Wire};
+    uint32_t warmup_ = 200;
 };

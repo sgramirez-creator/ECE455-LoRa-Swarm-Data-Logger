@@ -5,7 +5,9 @@ const char* telemetry_csv_header() {
     return "schema,node_id,uptime_s,epoch_s,lat,lon,alt_m,sats,"
            "air_t_c,air_rh,air_p_hpa,gas_kohm,"
            "w_t_c,w_ph,w_do,w_cond,w_turb,"
-           "rain_mm,wind_ms,wind_dir,batt_v,solar_v,rssi,flags";
+           "rain_mm,wind_ms,wind_dir,"
+           "ts_n,ts0,ts1,ts2,ts3,ts4,ts5,ts6,ts7,"
+           "batt_v,solar_v,rssi,flags";
 }
 
 // Print a float or an empty cell when the value is NaN.
@@ -38,6 +40,10 @@ int telemetry_to_csv(const TelemetryRecord& r, char* buf, int buflen) {
     w += put_f(buf + w, buflen - w, r.rain_mm, 2);
     w += put_f(buf + w, buflen - w, r.wind_speed_ms, 2);
     w += put_f(buf + w, buflen - w, r.wind_dir_deg, 0);
+
+    w += snprintf(buf + w, buflen - w, ",%u", r.temp_string_count);
+    for (int i = 0; i < TELEMETRY_TEMP_STRING_MAX; ++i)
+        w += put_f(buf + w, buflen - w, r.temp_string_c[i], 3);
 
     w += put_f(buf + w, buflen - w, r.battery_v, 3);
     w += put_f(buf + w, buflen - w, r.solar_v, 3);

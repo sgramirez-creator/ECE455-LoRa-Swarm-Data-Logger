@@ -17,18 +17,28 @@
 ```
 include/
   config.h              all build-time tunables + feature flags (one file = one node's behaviour)
-  telemetry.h           TelemetryRecord: packed, versioned measurement struct — the shared contract
+  telemetry.h           TelemetryRecord: packed, versioned measurement struct (schema v2) — the shared contract
   board.h               LEDs, safety light, battery sense, boot banner
   scheduler.h           fixed-interval cycle trigger (millis now; RTC-alarm later)
   DataLog.h             append-only CSV log on LittleFS (internal flash)
   LoRaLink.h            SX1262 P2P transport (bench transport + non-Meshtastic fallback)
+  Rs485Bus.h            shared half-duplex RS485/Modbus UART (RAK5802)
   sensors/
     ISensor.h           abstract sensor driver interface (ModularSensors-style)
     SensorManager.h     registry + one-cycle orchestration (overlapped warmup)
-    BME680Sensor.h      RAK1906 — STUB (synthetic data)
-    GNSSSensor.h        RAK12500 — STUB (fixed test coord)
+    RtcSensor.h         RAK12002 RV-3028-C7 — epoch + (phase 3) wake alarm
+    BME680Sensor.h      RAK1906 — Adafruit BME680
+    GNSSSensor.h        RAK12500 — SparkFun u-blox v2 (ZOE-M8Q)
+    TempString.h        DS18B20 1-Wire chain (≤ 8), vertical profile
+    ModbusSonde.h       water-quality sonde, Modbus RTU over RS485
+    WeatherStation.h    integrated met station, Modbus RTU over RS485
+    RainGauge.h         tipping-bucket, pin-change interrupt counter
 src/                    matching .cpp for each of the above + main.cpp
 ```
+
+See [03-phase2-sensors.md](03-phase2-sensors.md) for the sensor drivers, the
+sampling-priority order, and the config assumptions that need confirming against
+real hardware.
 
 ### Data flow (one measurement cycle)
 
@@ -81,9 +91,14 @@ pio run -t upload        # drag-and-drop UF2, or 1200bps-touch auto-reset
 pio device monitor       # 115200
 ```
 
-## Next (Phase 2 / 3)
+## Phase 2 status — sensor integration ✅ (builds; hardware-pending)
+
+All eight line items implemented as `ISensor` drivers with boot-time presence
+detection. Details + the assumptions to verify: [03-phase2-sensors.md](03-phase2-sensors.md).
+
+## Next (Phase 3)
 
 1. Decide Meshtastic vs LoRaWAN vs P2P (blocks the real transport implementation).
-2. Real BME680 + GNSS drivers; then RTC, rain gauge, RS-485 sonde, temperature string, weather station.
-3. `data validation` layer between `SensorManager.sample()` and `datalog::append()` (range/rate checks → `TELEMETRY_FLAG_*`).
-4. RTC-alarm deep sleep in the scheduler; measure the power budget against the 6–7 month goal.
+2. `data validation` layer between `SensorManager.sample()` and `datalog::append()` (range/rate checks → `TELEMETRY_FLAG_*`).
+3. RTC-alarm deep sleep in the scheduler; measure the power budget against the 6–7 month goal.
+4. Switched power rails for GNSS / RS485 / sonde.
