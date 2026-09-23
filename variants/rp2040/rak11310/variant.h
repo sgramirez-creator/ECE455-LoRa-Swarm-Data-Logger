@@ -61,3 +61,15 @@
 #define ETH_SPI_PORT SPI
 
 #define PIN_ETH_POWER_EN 22
+
+// RAK12501 GNSS (Quectel L76K) in sensor slot A of a RAK19001.
+// Slot A UART is routed to RP2040 UART0 (Serial1), the GPS default port.
+#define HAS_GPS 1
+#define GPS_TX_PIN 0  // TXD0 -> GNSS RX
+#define GPS_RX_PIN 1  // RXD0 <- GNSS TX
+#define PIN_GPS_PPS 6 // WB_IO1
+
+// WB_IO2 powers the slot A/B modules (including the GNSS). It is shared with
+// other modules, so it is held high at boot rather than used as PIN_GPS_EN,
+// which would switch it off during GPS power saving.
+#define PIN_POWER_EN 22 // WB_IO2
