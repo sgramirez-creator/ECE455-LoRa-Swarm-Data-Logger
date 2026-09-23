@@ -1,1 +1,0 @@
-// Just for consistency, for RAK11200 ESP32 Wrover all definitions are in the pins_arduino.h
