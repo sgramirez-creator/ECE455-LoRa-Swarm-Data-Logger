@@ -56,3 +56,16 @@ CMakeLists.txt
 .python3
 .claude/scheduled_tasks.lock
 userPrefs.jsonc.mcp-session-bak
+
+# Python virtual environment
+.venv/
+
+# Python temporary files
+__pycache__/
+*.pyc
+
+# Local sensor database
+*.db
+
+# Private Streamlit credentials
+.streamlit/secrets.toml

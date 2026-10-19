@@ -1,6 +1,6 @@
+
 import sqlite3
-import random
-import time
+import json
 from datetime import datetime
 
 DB_FILE = "sensor_data.db"
@@ -24,51 +24,57 @@ CREATE TABLE IF NOT EXISTS measurements (
 conn.commit()
 
 print("Receiver started...")
-print("Writing simulated sensor data to SQLite.")
+print("Enter a simulated Meshtastic message.")
+print("Type 'exit' to quit.")
 
 while True:
+    message = input("\nIncoming message: ")
 
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if message.lower() == "exit":
+        break
 
-    node_id = random.choice([1, 2])
+    try:
+        data = json.loads(message)
 
-    water_temp = round(random.uniform(18.0, 20.0), 2)
-    ph = round(random.uniform(7.0, 7.5), 2)
-    conductivity = round(random.uniform(400, 420), 1)
-    dissolved_oxygen = round(random.uniform(7.5, 8.5), 2)
-    turbidity = round(random.uniform(2.0, 2.5), 2)
+        timestamp = datetime.now().strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
 
-    cursor.execute("""
-    INSERT INTO measurements (
-        timestamp,
-        node_id,
-        water_temp,
-        ph,
-        conductivity,
-        dissolved_oxygen,
-        turbidity
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (
-        timestamp,
-        node_id,
-        water_temp,
-        ph,
-        conductivity,
-        dissolved_oxygen,
-        turbidity
-    ))
+        node_id = int(data["node_id"])
+        water_temp = float(data["water_temp"])
+        ph = float(data["ph"])
+        conductivity = float(data["conductivity"])
+        dissolved_oxygen = float(data["dissolved_oxygen"])
+        turbidity = float(data["turbidity"])
 
-    conn.commit()
+        cursor.execute("""
+        INSERT INTO measurements (
+            timestamp,
+            node_id,
+            water_temp,
+            ph,
+            conductivity,
+            dissolved_oxygen,
+            turbidity
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            timestamp,
+            node_id,
+            water_temp,
+            ph,
+            conductivity,
+            dissolved_oxygen,
+            turbidity
+        ))
 
-    print(
-        timestamp,
-        node_id,
-        water_temp,
-        ph,
-        conductivity,
-        dissolved_oxygen,
-        turbidity
-    )
+        conn.commit()
 
-    time.sleep(10)
+        print("Measurement saved successfully!")
+        print(data)
+
+    except (json.JSONDecodeError, KeyError,
+            ValueError, TypeError) as e:
+        print("Invalid message:", e)
+
+conn.close()
