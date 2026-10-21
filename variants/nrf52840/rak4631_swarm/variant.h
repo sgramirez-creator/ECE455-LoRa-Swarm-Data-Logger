@@ -225,13 +225,20 @@ SO GPIO 39/TXEN MAY NOT BE DEFINED FOR SUCCESSFUL OPERATION OF THE SX1262 - TG
 #define HAS_GNSS_I2C 1
 #define GNSS_I2C_ADDR 0x42
 
-// Yosemitech Y4000 sonde over the RAK5802 (auto-direction RS485, no DE pin needed).
+// RS485 bus on the RAK5802 (auto-direction, no DE pin needed). Every device on it must use this baud rate
+// and a unique Modbus address.
 #define HAS_SONDE 1
-#define SONDE_SERIAL Serial1
-#define SONDE_BAUD 9600
+#define RS485_SERIAL Serial1
+#define RS485_BAUD 9600
+// Yosemitech Y4000 sonde.
 #define SONDE_MODBUS_ADDR 1
+// DFRobot SEN0657 7-in-1 ultrasonic weather station (factory default is addr 1 at 4800 baud; must be changed).
+#define WX_MODBUS_ADDR 2
 // Y4000 12 V load switch enable, active high. P0.28 = header pin "IO7" on the RAK19001. Set -1 if always powered.
 #define SONDE_POWER_PIN 28
+
+// Freshly flashed swarm boards come up as "Swarm xxxx" (last 4 hex digits of the node ID).
+#define OWNER_LONG_NAME_PREFIX "Swarm"
 
 // RAK12002 RTC Module
 #define RV3028_RTC (uint8_t)0b1010010

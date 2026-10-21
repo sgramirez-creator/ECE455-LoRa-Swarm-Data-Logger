@@ -6,6 +6,7 @@
 #include "NodeDB.h"
 #include "RTC.h"
 #include "Throttle.h"
+#include <algorithm>
 #include <math.h>
 #include <string.h>
 
@@ -23,6 +24,10 @@ SondeModule *sondeModule;
 #ifndef SONDE_POWER_PIN
 #define SONDE_POWER_PIN -1
 #endif
+// 0 = no weather station on the bus.
+#ifndef WX_MODBUS_ADDR
+#define WX_MODBUS_ADDR 0
+#endif
 
 static constexpr int32_t FIRST_CYCLE_DELAY_MS = 45 * 1000;
 static constexpr int32_t WARMUP_MS = 2000;         // Y4000 answers ~1 s after power-up
@@ -32,6 +37,12 @@ static constexpr int32_t REPLY_POLL_MS = 50;
 static constexpr int32_t RETRY_GAP_MS = 500;
 static constexpr int32_t STEP_MS = 10;
 static constexpr uint8_t MAX_ATTEMPTS = 3;
+static constexpr uint32_t ERROR_REPORT_INTERVAL_MS = 5 * 60 * 1000;
+// DFRobot asks for > 200 ms between SEN0657 polls; at 200 ms it mostly answered with a fixed "not ready" pattern.
+static constexpr int32_t WX_GAP_MS = 1000;
+static constexpr uint8_t WX_MAX_ATTEMPTS = 2;
+// Intervals shorter than a power-up + stabilisation cycle keep the sonde powered and skip the brush between reads.
+static constexpr bool CONTINUOUS = SONDE_INTERVAL_SECS * 1000 < WARMUP_MS + STABILIZE_MS;
 
 static constexpr uint8_t FN_READ_HOLDING = 0x03;
 static constexpr uint8_t FN_WRITE_MULTIPLE = 0x10;
@@ -41,6 +52,21 @@ static constexpr uint16_t REG_STATUS = 0x0800;
 static constexpr uint16_t REG_BRUSH = 0x2F00;
 static constexpr size_t VALUES_REPLY_LEN = 5 + 8 * 4; // addr, fn, byte count, 8 floats, crc16
 static constexpr size_t STATUS_REPLY_LEN = 5 + 2;
+
+// DFRobot SEN0657: one block read 0x01F4..0x0201 covers every measurement (big-endian 16-bit registers).
+// One register per request: on this unit at 9600 baud, multi-register reads usually come back as a constant
+// "not ready" pattern (0x32D0, 0xF000, ...) while single-register reads are reliable.
+static constexpr uint16_t WX_REGS[] = {
+    0x01F4, // wind speed, m/s x10
+    0x01F7, // wind direction, degrees (0 = north, clockwise)
+    0x01F8, // humidity, %RH x10
+    0x01F9, // temperature, degC x10 (signed)
+    0x01FD, // pressure, 0.1 kPa = hPa
+    0x01FE, // light, high word
+    0x01FF, // light, low word
+    0x0201, // rain, mm x10, accumulated since power-up or zeroing
+};
+static constexpr uint8_t WX_READ_COUNT = sizeof(WX_REGS) / sizeof(WX_REGS[0]);
 
 enum ValueIndex : uint8_t { DO_MGL, TURBIDITY_NTU, COND_MS_CM, PH, TEMP_C, ORP_MV, CHL_UG_L, BGA };
 
@@ -143,6 +169,14 @@ struct JsonWriter {
         return ok ? len : 0;
     }
 };
+
+void addPosition(JsonWriter &j)
+{
+    if (localPosition.latitude_i != 0 || localPosition.longitude_i != 0) {
+        j.fixed("lat", localPosition.latitude_i / 10, 6);
+        j.fixed("lon", localPosition.longitude_i / 10, 6);
+    }
+}
 } // namespace
 
 SondeModule::SondeModule() : SinglePortModule("sonde", meshtastic_PortNum_PRIVATE_APP), concurrency::OSThread("Sonde") {}
@@ -154,9 +188,10 @@ void SondeModule::powerSonde(bool on)
 #endif
     // The UART is only open while the sonde is powered so the UARTE doesn't hold HFCLK on between cycles.
     if (on)
-        SONDE_SERIAL.begin(SONDE_BAUD);
+        RS485_SERIAL.begin(RS485_BAUD);
     else
-        SONDE_SERIAL.end();
+        RS485_SERIAL.end();
+    powered = on;
 }
 
 void SondeModule::sendFrame(uint8_t *frame, size_t lenWithoutCrc)
@@ -165,23 +200,22 @@ void SondeModule::sendFrame(uint8_t *frame, size_t lenWithoutCrc)
     frame[lenWithoutCrc] = crc & 0xFF;
     frame[lenWithoutCrc + 1] = crc >> 8;
 
-    while (SONDE_SERIAL.available())
-        SONDE_SERIAL.read();
-    SONDE_SERIAL.write(frame, lenWithoutCrc + 2);
-    SONDE_SERIAL.flush();
+    while (RS485_SERIAL.available())
+        RS485_SERIAL.read();
+    RS485_SERIAL.write(frame, lenWithoutCrc + 2);
+    RS485_SERIAL.flush();
     // Discard any transceiver echo; a Modbus slave must stay silent for 3.5 chars (~4 ms) before replying.
     delay(2);
-    while (SONDE_SERIAL.available())
-        SONDE_SERIAL.read();
+    while (RS485_SERIAL.available())
+        RS485_SERIAL.read();
 
     rxLen = 0;
     requestSentMs = millis();
 }
 
-void SondeModule::requestRegisters(uint16_t start, uint16_t count)
+void SondeModule::requestRegisters(uint8_t addr, uint16_t start, uint16_t count)
 {
-    uint8_t frame[8] = {SONDE_MODBUS_ADDR, FN_READ_HOLDING,       (uint8_t)(start >> 8),
-                        (uint8_t)start,    (uint8_t)(count >> 8), (uint8_t)count};
+    uint8_t frame[8] = {addr, FN_READ_HOLDING, (uint8_t)(start >> 8), (uint8_t)start, (uint8_t)(count >> 8), (uint8_t)count};
     sendFrame(frame, 6);
 }
 
@@ -191,14 +225,14 @@ void SondeModule::requestBrush()
     sendFrame(frame, 7);
 }
 
-SondeModule::Reply SondeModule::pollReply(size_t expectedLen)
+SondeModule::Reply SondeModule::pollReply(uint8_t addr, size_t expectedLen)
 {
-    while (SONDE_SERIAL.available() && rxLen < sizeof(rx))
-        rx[rxLen++] = SONDE_SERIAL.read();
+    while (RS485_SERIAL.available() && rxLen < sizeof(rx))
+        rx[rxLen++] = RS485_SERIAL.read();
 
-    // Resync on our slave address in case the transceiver produced noise at power-up.
+    // Resync on the slave address in case the transceiver produced noise at power-up.
     size_t skip = 0;
-    while (skip < rxLen && rx[skip] != SONDE_MODBUS_ADDR)
+    while (skip < rxLen && rx[skip] != addr)
         skip++;
     if (skip) {
         memmove(rx, rx + skip, rxLen - skip);
@@ -206,7 +240,7 @@ SondeModule::Reply SondeModule::pollReply(size_t expectedLen)
     }
 
     if (rxLen >= 5 && (rx[1] & 0x80)) {
-        LOG_WARN("Sonde: Modbus exception 0x%02x", rx[2]);
+        LOG_WARN("RS485: Modbus exception 0x%02x from addr %u", rx[2], addr);
         return Reply::Failed;
     }
     if (rxLen >= expectedLen) {
@@ -215,13 +249,13 @@ SondeModule::Reply SondeModule::pollReply(size_t expectedLen)
         bool shapeOk = rx[1] == FN_READ_HOLDING && rx[2] == expectedLen - 5;
         if (crcOk && shapeOk)
             return Reply::Ok;
-        LOG_WARN("Sonde: bad reply (crc ok=%d, shape ok=%d, %u bytes)", crcOk, shapeOk, rxLen);
+        LOG_WARN("RS485: bad reply from addr %u (crc ok=%d, shape ok=%d, %u bytes)", addr, crcOk, shapeOk, rxLen);
         return Reply::Failed;
     }
     if (Throttle::isWithinTimespanMs(requestSentMs, REPLY_TIMEOUT_MS))
         return Reply::Pending;
 
-    LOG_WARN("Sonde: no reply from Modbus addr %u (%u bytes)", SONDE_MODBUS_ADDR, rxLen);
+    LOG_WARN("RS485: no reply from Modbus addr %u (%u bytes)", addr, rxLen);
     return Reply::Failed;
 }
 
@@ -231,6 +265,47 @@ void SondeModule::decodeValues()
     for (uint8_t i = 0; i < VALUE_COUNT; i++)
         memcpy(&values[i], &rx[3 + 4 * i], sizeof(float));
     valuesOk = true;
+}
+
+void SondeModule::decodeWeather()
+{
+    const uint16_t raw = (uint16_t)((rx[3] << 8) | rx[4]);
+    LOG_DEBUG("RS485: weather reg 0x%04x = 0x%04x (%u)", WX_REGS[weatherPart], raw, raw);
+    // Physically impossible values are dropped (left NaN) so a stray "not ready" word never reaches the mesh.
+    auto keep = [](float &field, float value, float low, float high) {
+        if (value >= low && value <= high)
+            field = value;
+    };
+    switch (weatherPart) {
+    case 0:
+        keep(weather.windSpeed, raw / 10.0f, 0, 75);
+        break;
+    case 1:
+        keep(weather.windDir, raw, 0, 360);
+        break;
+    case 2:
+        keep(weather.humidity, raw / 10.0f, 0, 100);
+        break;
+    case 3:
+        keep(weather.airTemp, (int16_t)raw / 10.0f, -50, 70);
+        break;
+    case 4:
+        keep(weather.pressureHpa, raw, 300, 1100);
+        break;
+    case 5:
+        luxHigh = raw;
+        luxHighOk = true;
+        return;
+    case 6:
+        if (luxHighOk)
+            keep(weather.lux, (float)(((uint32_t)luxHigh << 16) | raw), 0, 250000);
+        break;
+    case 7:
+        keep(weather.rainMm, raw / 10.0f, 0, 1000);
+        break;
+    }
+    weatherOk = weatherOk || !isnan(weather.windSpeed) || !isnan(weather.windDir) || !isnan(weather.humidity) ||
+                !isnan(weather.airTemp) || !isnan(weather.pressureHpa) || !isnan(weather.lux) || !isnan(weather.rainMm);
 }
 
 void SondeModule::simulateValues()
@@ -245,6 +320,12 @@ void SondeModule::simulateValues()
     values[CHL_UG_L] = jitter(1.5f, 0.5f);
     values[BGA] = jitter(300.0f, 100.0f);
     valuesOk = true;
+    if (WX_MODBUS_ADDR) {
+        weather = {jitter(3.0f, 2.0f),        jitter(180.0f, 90.0f), jitter(15.0f, 2.0f),
+                   jitter(60.0f, 10.0f),      jitter(1013.0f, 5.0f), 0.0f,
+                   jitter(20000.0f, 10000.0f)};
+        weatherOk = true;
+    }
 }
 
 size_t SondeModule::buildJson(char *buf, size_t cap, bool compact)
@@ -277,25 +358,35 @@ size_t SondeModule::buildJson(char *buf, size_t cap, bool compact)
         j.str("err", "no_reply");
     }
 
-    if (localPosition.latitude_i != 0 || localPosition.longitude_i != 0) {
-        j.fixed("lat", localPosition.latitude_i / 10, 6);
-        j.fixed("lon", localPosition.longitude_i / 10, 6);
-    }
+    addPosition(j);
     return j.finish();
 }
 
-void SondeModule::sendReport()
+size_t SondeModule::buildWeatherJson(char *buf, size_t cap)
 {
-    char json[meshtastic_Constants_DATA_PAYLOAD_LEN + 1];
-    size_t len = buildJson(json, sizeof(json), false);
-    if (len == 0)
-        len = buildJson(json, sizeof(json), true);
-    if (len == 0) {
-        LOG_ERROR("Sonde: report exceeds %d bytes, dropped", meshtastic_Constants_DATA_PAYLOAD_LEN);
-        return;
-    }
-    LOG_INFO("Sonde: %s", json);
+    JsonWriter j(buf, cap);
+    j.integer("node_id", nodeDB->getNodeNum());
+    j.str("type", "wx");
+    j.integer("seq", weatherSeq);
+    uint32_t now = getValidTime(RTCQualityDevice);
+    if (now)
+        j.integer("t", now);
+    if (SONDE_SIMULATE)
+        j.integer("sim", 1);
+    j.number("wind_speed", weather.windSpeed, 1);
+    j.number("wind_dir", weather.windDir, 0);
+    j.number("air_temp", weather.airTemp, 1);
+    j.number("humidity", weather.humidity, 1);
+    j.number("pressure", weather.pressureHpa, 0);
+    j.number("lux", weather.lux, 0);
+    j.number("rain", weather.rainMm, 1);
+    addPosition(j);
+    return j.finish();
+}
 
+void SondeModule::sendJson(const char *json, size_t len)
+{
+    LOG_INFO("RS485: %s", json);
     meshtastic_MeshPacket *p = allocDataPacket();
     p->to = NODENUM_BROADCAST;
     p->want_ack = false;
@@ -303,16 +394,55 @@ void SondeModule::sendReport()
     memcpy(p->decoded.payload.bytes, json, len);
     // ccToPhone so a receiver plugged into this node over USB also gets its own readings.
     service->sendToMesh(p, RX_SRC_LOCAL, true);
-    seq++;
+}
+
+void SondeModule::sendReport()
+{
+    char json[meshtastic_Constants_DATA_PAYLOAD_LEN + 1];
+
+    // A node with no sonde attached (e.g. a relay) shouldn't flood the mesh with error reports.
+    if (valuesOk || !errorReported || !Throttle::isWithinTimespanMs(lastErrorReportMs, ERROR_REPORT_INTERVAL_MS)) {
+        size_t len = buildJson(json, sizeof(json), false);
+        if (len == 0)
+            len = buildJson(json, sizeof(json), true);
+        if (len) {
+            sendJson(json, len);
+            seq++;
+        } else {
+            LOG_ERROR("Sonde: report exceeds %d bytes, dropped", meshtastic_Constants_DATA_PAYLOAD_LEN);
+        }
+        errorReported = !valuesOk;
+        lastErrorReportMs = millis();
+    } else {
+        LOG_DEBUG("Sonde: still no reply, error report suppressed");
+    }
+
+    if (weatherOk) {
+        size_t len = buildWeatherJson(json, sizeof(json));
+        if (len) {
+            sendJson(json, len);
+            weatherSeq++;
+        }
+    }
 }
 
 int32_t SondeModule::msUntilNextCycle()
 {
-    // Align to wall-clock boundaries (e.g. :00 and :30) once time is known, so every node samples together.
+    const uint64_t intervalMs = (uint64_t)SONDE_INTERVAL_SECS * 1000;
     uint32_t now = getValidTime(RTCQualityDevice);
     if (now == 0)
-        return SONDE_INTERVAL_SECS * 1000;
-    return (int32_t)(SONDE_INTERVAL_SECS - now % SONDE_INTERVAL_SECS) * 1000;
+        return (int32_t)intervalMs;
+
+    // Align to wall-clock boundaries (e.g. :00 and :30) so the swarm samples together, offset per node by a fixed
+    // hash of its ID so nodes on the same boundary don't all transmit at once.
+    const uint64_t spreadMs = std::min<uint64_t>(intervalMs / 2, 60 * 1000);
+    const uint64_t offsetMs = spreadMs ? ((uint64_t)nodeDB->getNodeNum() * 2654435761u) % spreadMs : 0;
+    const uint64_t nowMs = (uint64_t)now * 1000;
+    uint64_t target = ((nowMs + intervalMs - offsetMs) / intervalMs) * intervalMs + offsetMs;
+    // `now` only has 1 s resolution, so make sure we never re-fire the slot we just ran.
+    if (target < nowMs + 2000)
+        target += intervalMs;
+    return (int32_t)(target - nowMs);
 }
 
 int32_t SondeModule::runOnce()
@@ -323,21 +453,29 @@ int32_t SondeModule::runOnce()
         pinMode(SONDE_POWER_PIN, OUTPUT);
         digitalWrite(SONDE_POWER_PIN, LOW);
 #endif
-        LOG_INFO("Sonde: Y4000 at Modbus addr %u, every %us%s", SONDE_MODBUS_ADDR, SONDE_INTERVAL_SECS,
-                 SONDE_SIMULATE ? " (SIMULATED)" : "");
+        LOG_INFO("RS485: Y4000 sonde at Modbus addr %u, SEN0657 weather station at addr %u (0 = none), every %us%s",
+                 SONDE_MODBUS_ADDR, WX_MODBUS_ADDR, SONDE_INTERVAL_SECS, SONDE_SIMULATE ? " (SIMULATED)" : "");
         step = Step::Idle;
         return FIRST_CYCLE_DELAY_MS;
 
     case Step::Idle:
         valuesOk = false;
         statusOk = false;
+        weatherOk = false;
+        weatherPart = 0;
+        luxHighOk = false;
+        weather = {NAN, NAN, NAN, NAN, NAN, NAN, NAN};
         attempts = 0;
         if (SONDE_SIMULATE) {
             simulateValues();
             step = Step::Report;
             return STEP_MS;
         }
-        LOG_INFO("Sonde: power on");
+        if (powered) {
+            step = Step::RequestValues;
+            return STEP_MS;
+        }
+        LOG_INFO("Sonde: power on%s", CONTINUOUS ? " (continuous mode, stays powered)" : "");
         powerSonde(true);
         step = Step::Brush;
         return WARMUP_MS;
@@ -349,12 +487,12 @@ int32_t SondeModule::runOnce()
         return STABILIZE_MS;
 
     case Step::RequestValues:
-        requestRegisters(REG_VALUES, VALUE_COUNT * 2);
+        requestRegisters(SONDE_MODBUS_ADDR, REG_VALUES, VALUE_COUNT * 2);
         step = Step::AwaitValues;
         return REPLY_POLL_MS;
 
     case Step::AwaitValues:
-        switch (pollReply(VALUES_REPLY_LEN)) {
+        switch (pollReply(SONDE_MODBUS_ADDR, VALUES_REPLY_LEN)) {
         case Reply::Pending:
             return REPLY_POLL_MS;
         case Reply::Ok:
@@ -366,30 +504,53 @@ int32_t SondeModule::runOnce()
                 step = Step::RequestValues;
                 return RETRY_GAP_MS;
             }
-            step = Step::Report;
-            return STEP_MS;
+            attempts = 0;
+            step = WX_MODBUS_ADDR ? Step::RequestWeather : Step::Report;
+            return WX_MODBUS_ADDR ? WX_GAP_MS : STEP_MS;
         }
         break;
 
     case Step::RequestStatus:
-        requestRegisters(REG_STATUS, 1);
+        requestRegisters(SONDE_MODBUS_ADDR, REG_STATUS, 1);
         step = Step::AwaitStatus;
         return REPLY_POLL_MS;
 
     case Step::AwaitStatus: {
-        Reply r = pollReply(STATUS_REPLY_LEN);
+        Reply r = pollReply(SONDE_MODBUS_ADDR, STATUS_REPLY_LEN);
         if (r == Reply::Pending)
             return REPLY_POLL_MS;
         if (r == Reply::Ok) {
             status = rx[3];
             statusOk = true;
         }
-        step = Step::Report;
-        return STEP_MS;
+        attempts = 0;
+        step = WX_MODBUS_ADDR ? Step::RequestWeather : Step::Report;
+        return WX_MODBUS_ADDR ? WX_GAP_MS : STEP_MS;
+    }
+
+    case Step::RequestWeather:
+        requestRegisters(WX_MODBUS_ADDR, WX_REGS[weatherPart], 1);
+        step = Step::AwaitWeather;
+        return REPLY_POLL_MS;
+
+    case Step::AwaitWeather: {
+        Reply r = pollReply(WX_MODBUS_ADDR, 5 + 2);
+        if (r == Reply::Pending)
+            return REPLY_POLL_MS;
+        if (r == Reply::Failed && ++attempts < WX_MAX_ATTEMPTS) {
+            step = Step::RequestWeather;
+            return WX_GAP_MS;
+        }
+        if (r == Reply::Ok)
+            decodeWeather();
+        attempts = 0;
+        // A part that never answered leaves its fields NaN, which the JSON writer omits.
+        step = ++weatherPart < WX_READ_COUNT ? Step::RequestWeather : Step::Report;
+        return step == Step::Report ? STEP_MS : WX_GAP_MS;
     }
 
     case Step::Report:
-        if (!SONDE_SIMULATE) {
+        if (!SONDE_SIMULATE && !CONTINUOUS) {
             powerSonde(false);
             LOG_INFO("Sonde: power off");
         }

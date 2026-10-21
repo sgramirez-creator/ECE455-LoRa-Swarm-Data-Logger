@@ -1127,6 +1127,9 @@ void NodeDB::installDefaultDeviceState()
     pickNewNodeNum(); // based on macaddr now
 #ifdef USERPREFS_CONFIG_OWNER_LONG_NAME
     snprintf(owner.long_name, sizeof(owner.long_name), (const char *)USERPREFS_CONFIG_OWNER_LONG_NAME);
+#elif defined(OWNER_LONG_NAME_PREFIX)
+    // Unique per board, unlike a fixed USERPREFS name shared by every node flashed from the same build.
+    snprintf(owner.long_name, sizeof(owner.long_name), OWNER_LONG_NAME_PREFIX " %04x", getNodeNum() & 0x0ffff);
 #else
     snprintf(owner.long_name, sizeof(owner.long_name), "Meshtastic %04x", getNodeNum() & 0x0ffff);
 #endif

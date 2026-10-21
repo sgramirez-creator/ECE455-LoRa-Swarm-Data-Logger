@@ -69,3 +69,6 @@ __pycache__/
 
 # Private Streamlit credentials
 .streamlit/secrets.toml
+# Dashboard runtime logs
+ui/logs/
+ui/.swarm_channel.json
