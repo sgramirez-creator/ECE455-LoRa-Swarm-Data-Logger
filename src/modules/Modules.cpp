@@ -100,6 +100,12 @@
 #if !MESHTASTIC_EXCLUDE_STATUS
 #include "modules/StatusMessageModule.h"
 #endif
+#if defined(HAS_GNSS_I2C) && !MESHTASTIC_EXCLUDE_GPS
+#include "modules/GnssI2CModule.h"
+#endif
+#ifdef HAS_SONDE
+#include "modules/SondeModule.h"
+#endif
 
 #if defined(HAS_HARDWARE_WATCHDOG)
 #include "watchdog/watchdogThread.h"
@@ -128,6 +134,12 @@ void setupModules()
 #endif
 #if !MESHTASTIC_EXCLUDE_GPS
     positionModule = new PositionModule();
+#endif
+#if defined(HAS_GNSS_I2C) && !MESHTASTIC_EXCLUDE_GPS
+    gnssI2CModule = new GnssI2CModule();
+#endif
+#ifdef HAS_SONDE
+    sondeModule = new SondeModule();
 #endif
 #if !MESHTASTIC_EXCLUDE_WAYPOINT
     waypointModule = new WaypointModule();
