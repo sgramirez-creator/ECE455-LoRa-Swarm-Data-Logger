@@ -6,6 +6,7 @@
 """
 
 import argparse
+import faulthandler
 import json
 import signal
 import sqlite3
@@ -138,8 +139,26 @@ def open_db():
         updated_at TEXT
     )
     """)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS base_station (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        node_id INTEGER,
+        connected INTEGER,
+        seen_at INTEGER
+    )
+    """)
     conn.commit()
     return conn
+
+
+def set_base_station(conn, node_id, connected):
+    # Heartbeat the dashboard uses to show which board is plugged in over USB.
+    with db_lock:
+        conn.execute(
+            "INSERT OR REPLACE INTO base_station (id, node_id, connected, seen_at) VALUES (1, ?, ?, ?)",
+            (node_id, 1 if connected else 0, int(time.time())),
+        )
+        conn.commit()
 
 
 def local_time(epoch=None):
@@ -185,19 +204,22 @@ def insert_row(conn, table, row):
     return cursor.rowcount
 
 
-def upsert_node(conn, node_id, user=None, last_heard=None):
+def upsert_node(conn, node_id, user=None, last_heard=None, authoritative=False):
+    # Only a node's own NODEINFO broadcast (or a base station describing itself) may change a stored name.
+    # Base stations' remembered node lists can be hours stale (e.g. right after a rename), so they only fill gaps.
     user = user or {}
+    newer, older = ("excluded", "nodes") if authoritative else ("nodes", "excluded")
     with db_lock:
         conn.execute(
-            """
+            f"""
             INSERT INTO nodes (node_id, node_hex, long_name, short_name, hw_model, role, last_heard, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(node_id) DO UPDATE SET
-                long_name = COALESCE(excluded.long_name, nodes.long_name),
-                short_name = COALESCE(excluded.short_name, nodes.short_name),
-                hw_model = COALESCE(excluded.hw_model, nodes.hw_model),
-                role = COALESCE(excluded.role, nodes.role),
-                last_heard = COALESCE(excluded.last_heard, nodes.last_heard),
+                long_name = COALESCE({newer}.long_name, {older}.long_name),
+                short_name = COALESCE({newer}.short_name, {older}.short_name),
+                hw_model = COALESCE({newer}.hw_model, {older}.hw_model),
+                role = COALESCE({newer}.role, {older}.role),
+                last_heard = MAX(COALESCE(excluded.last_heard, 0), COALESCE(nodes.last_heard, 0)),
                 updated_at = excluded.updated_at
             """,
             (
@@ -297,8 +319,9 @@ def on_receive(packet, interface, conn, gateway_id):
         sender = packet.get("from")
         if sender is not None:
             known = interface.nodes.get(packet.get("fromId"), {}) if interface and interface.nodes else {}
-            user = decoded.get("user") if portnum == "NODEINFO_APP" else known.get("user")
-            upsert_node(conn, sender, user, known.get("lastHeard"))
+            announced = portnum == "NODEINFO_APP"
+            user = decoded.get("user") if announced else known.get("user")
+            upsert_node(conn, sender, user, known.get("lastHeard"), authoritative=announced)
 
         if portnum == "PRIVATE_APP":
             data = json.loads(bytes(decoded.get("payload", b"")).decode("utf-8"))
@@ -331,36 +354,95 @@ def run_stdin(conn):
             print("Invalid message:", e)
 
 
+def close_quietly(interface):
+    # The connection is usually already broken here (board unplugged), so close() may fail too.
+    try:
+        interface.close()
+    except Exception:
+        pass
+
+
 def run_radio(conn, port):
     try:
         from pubsub import pub
         from meshtastic.serial_interface import SerialInterface
+        from meshtastic.util import findPorts
     except ImportError:
         sys.exit("The meshtastic package is missing: pip install -r requirements.txt")
 
     gateway = {"id": None}
+    lost = threading.Event()
 
-    # pypubsub keeps only weak references, so the handler must stay referenced while we run.
+    # pypubsub keeps only weak references, so the handlers must stay referenced while we run.
     def handle(packet, interface):
         on_receive(packet, interface, conn, gateway["id"])
 
-    pub.subscribe(handle, "meshtastic.receive")
-    interface = SerialInterface(devPath=port)
-    me = interface.getMyNodeInfo() or {}
-    gateway["id"] = me.get("num")
-    for node in (interface.nodes or {}).values():
-        if "num" in node:
-            upsert_node(conn, node["num"], node.get("user"), node.get("lastHeard"))
+    def on_lost(interface):
+        lost.set()
 
-    user = me.get("user", {})
-    print(f"Base station: {user.get('longName', 'Meshtastic radio')} ({user.get('id', '?')}). Waiting for data...")
+    pub.subscribe(handle, "meshtastic.receive")
+    pub.subscribe(on_lost, "meshtastic.connection.lost")
+
+    interface = None
     try:
         while True:
-            time.sleep(1)
+            # A re-plugged board can come back under a new port name, so also try every Meshtastic port found.
+            # Never pass devPath=None: with no board attached the library silently falls back to TCP.
+            candidates = [port] if port and Path(port).exists() else []
+            candidates += [p for p in findPorts(True) if p not in candidates]
+            last_error = "no Meshtastic board on USB"
+            for candidate in candidates:
+                try:
+                    attempt = SerialInterface(devPath=candidate)
+                except Exception as e:  # serial/USB errors vary by OS; just retry
+                    if "Timed out" in str(e):
+                        # A timed-out attempt leaves the library's reader thread holding the port and eating the
+                        # radio's replies, so retrying in-process can't succeed. Exit; dashboard.sh restarts us.
+                        print(f"Connection to {candidate} timed out; restarting the receiver to release the port")
+                        sys.exit(3)
+                    last_error = e
+                    continue
+                if getattr(attempt, "myInfo", None) is not None:
+                    interface = attempt
+                    break
+                last_error = f"{candidate} did not answer"
+                close_quietly(attempt)
+            if interface is None:
+                print(f"Base station not reachable ({last_error}); retrying in 5 s")
+                time.sleep(5)
+                continue
+
+            lost.clear()
+            me = interface.getMyNodeInfo() or {}
+            gateway["id"] = me.get("num")
+            for node in (interface.nodes or {}).values():
+                if "num" in node:
+                    upsert_node(
+                        conn, node["num"], node.get("user"), node.get("lastHeard"), authoritative=node["num"] == gateway["id"]
+                    )
+            user = me.get("user", {})
+            print(f"Base station: {user.get('longName', 'Meshtastic radio')} ({user.get('id', '?')}). Waiting for data...")
+            set_base_station(conn, gateway["id"], True)
+
+            ticks = 0
+            while not lost.wait(5):
+                set_base_station(conn, gateway["id"], True)
+                ticks += 1
+                if ticks % 6 == 0:  # every 30 s: when the base station last heard each node on the radio
+                    for node in list((interface.nodes or {}).values()):
+                        if "num" in node and node.get("lastHeard"):
+                            upsert_node(conn, node["num"], node.get("user"), node.get("lastHeard"))
+            print("Base station disconnected; reconnecting...")
+            set_base_station(conn, gateway["id"], False)
+            close_quietly(interface)
+            interface = None
+            time.sleep(3)
     except KeyboardInterrupt:
         pass
     finally:
-        interface.close()
+        set_base_station(conn, gateway["id"], False)
+        if interface:
+            close_quietly(interface)
 
 
 def main():
@@ -371,6 +453,8 @@ def main():
 
     # Background jobs ignore Ctrl-C, so dashboard.sh stops us with SIGTERM; exit through the cleanup path.
     signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
+    # A hard crash in the USB/serial layer leaves no Python traceback; this writes one to the log.
+    faulthandler.enable()
 
     conn = open_db()
     print(f"Writing to {DB_FILE}")

@@ -38,10 +38,18 @@ def fingerprint(psk):
     return hashlib.sha256(psk).hexdigest()[:8]
 
 
-def connect(port):
+def connect(port, wait_s=0):
     from meshtastic.serial_interface import SerialInterface
 
-    return SerialInterface(devPath=port)
+    # Some config writes reboot the node, so its USB port can be missing for a few seconds.
+    deadline = time.time() + wait_s
+    while True:
+        try:
+            return SerialInterface(devPath=port)
+        except (FileNotFoundError, OSError):
+            if time.time() > deadline:
+                raise
+            time.sleep(2)
 
 
 def main():
@@ -75,6 +83,20 @@ def main():
         if args.show_url:
             print("Channel URL:", node.getURL())
 
+        # Only replace Meshtastic's default name, never one somebody chose.
+        long_name = user.get("longName", "")
+        if long_name.startswith("Meshtastic "):
+            suffix = user.get("id", "!????")[-4:]
+            node.setOwner(long_name=f"Swarm {suffix}", short_name=suffix)
+            print(f"Renamed '{long_name}' to 'Swarm {suffix}'.")
+
+        # Relays otherwise only transmit every 30 min, which makes "is it on?" unknowable on the dashboard.
+        telemetry = node.moduleConfig.telemetry
+        if telemetry.device_update_interval == 0 or telemetry.device_update_interval > 300:
+            telemetry.device_update_interval = 300
+            node.writeConfig("telemetry")
+            print("Device telemetry set to every 5 min so the dashboard can tell when this node is on.")
+
         lora = node.localConfig.lora
         if lora.region == config_pb2.Config.LoRaConfig.RegionCode.UNSET:
             lora.region = config_pb2.Config.LoRaConfig.RegionCode.US
@@ -84,12 +106,16 @@ def main():
         interface.close()
 
     time.sleep(8)
-    interface = connect(args.port)
+    interface = connect(args.port, wait_s=45)
     try:
         primary = interface.localNode.getChannelByChannelIndex(0)
         ok = primary.settings.name == channel["name"] and bytes(primary.settings.psk) == psk
         region = config_pb2.Config.LoRaConfig.RegionCode.Name(interface.localNode.localConfig.lora.region)
-        print(f"Verified: channel '{primary.settings.name}', key {'matches' if ok else 'DOES NOT match'}, region {region}.")
+        name = (interface.getMyNodeInfo() or {}).get("user", {}).get("longName", "?")
+        print(
+            f"Verified: '{name}', channel '{primary.settings.name}', key {'matches' if ok else 'DOES NOT match'}, "
+            f"region {region}."
+        )
         if not ok:
             sys.exit(1)
     finally:

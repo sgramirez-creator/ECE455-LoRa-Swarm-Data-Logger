@@ -74,7 +74,9 @@ MAP_METRICS = {f"water:{c}": ("water", c) for c in WATER} | {
 }
 WINDOWS = {"Last 15 min": 15, "Last hour": 60, "Last 6 hours": 360, "Last 24 hours": 1440, "All time": None}
 VIEWS = ["Overview", "Water", "Weather", "Network", "Data"]
-ONLINE_WINDOW = timedelta(minutes=5)
+# Relays only transmit telemetry every few minutes (provision.py sets 5 min), so allow two intervals.
+ON_WINDOW = timedelta(minutes=10)
+PLUGGED_WINDOW = timedelta(seconds=20)
 COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
 # Heat-map ramp: blue (lowest) -> cyan -> yellow -> red (highest).
 RAMP = np.array([[49, 54, 149], [69, 170, 220], [254, 224, 100], [215, 48, 39]])
@@ -346,26 +348,54 @@ def show_heatmap(source, status, names, column, label, unit, decimals, height=40
 # ---------------------------------------------------------------- views
 
 
-def last_seen(water, weather, status):
+def load_presence():
+    """Which node is plugged in over USB right now, and when the base station last heard each node on the radio."""
+    plugged = None
+    base = load_table("base_station")
+    if not base.empty:
+        row = base.iloc[0]
+        fresh = pd.notna(row["seen_at"]) and datetime.now() - datetime.fromtimestamp(row["seen_at"]) < PLUGGED_WINDOW
+        if row["connected"] == 1 and fresh and pd.notna(row["node_id"]):
+            plugged = int(row["node_id"])
+    nodes = load_table("nodes")
+    heard = pd.Series(dtype="datetime64[ns]")
+    if not nodes.empty:
+        valid = nodes[nodes["last_heard"].fillna(0) > 0]
+        heard = pd.Series(
+            [datetime.fromtimestamp(t) for t in valid["last_heard"]], index=valid["node_id"].astype(int).values
+        )
+    return plugged, heard
+
+
+def last_seen(water, weather, status, radio_heard=None):
     frames = [f[["node_id", "timestamp"]] for f in (water, weather, status) if not f.empty]
+    if radio_heard is not None and not radio_heard.empty:
+        frames.append(pd.DataFrame({"node_id": radio_heard.index, "timestamp": radio_heard.values}))
     if not frames:
         return pd.Series(dtype="datetime64[ns]")
     return pd.concat(frames).groupby("node_id")["timestamp"].max()
 
 
-def status_strip(water, weather, status, names, node):
-    seen = last_seen(for_node(water, node), for_node(weather, node), for_node(status, node))
-    seen = seen[seen.index.isin(set(water["node_id"]) | set(weather["node_id"]))]
-    online = int((datetime.now() - seen < ONLINE_WINDOW).sum()) if not seen.empty else 0
-    newest = seen.max() if not seen.empty else None
+def presence_label(node_id, heard, plugged):
+    if node_id == plugged:
+        return "Plugged in (USB)"
+    if heard is not None and pd.notna(heard) and datetime.now() - heard < ON_WINDOW:
+        return "On"
+    return "Not heard"
+
+
+def status_strip(water, weather, status, names, node, presence):
+    plugged, radio_heard = presence
+    data_seen = last_seen(for_node(water, node), for_node(weather, node), pd.DataFrame())
+    newest = data_seen.max() if not data_seen.empty else None
+    members = swarm_members(water, weather, plugged)
+    seen = last_seen(water, weather, status, radio_heard)
+    on = sum(presence_label(n, seen.get(n), plugged) != "Not heard" for n in members)
 
     radio = pd.concat([f for f in (for_node(water, node), for_node(weather, node)) if not f.empty] or [pd.DataFrame()])
-    link_value, link_sub, gateway_value, gateway_sub = "—", "", "—", ""
+    link_value, link_sub = "—", ""
     if not radio.empty:
         radio = radio.sort_values("timestamp")
-        latest = radio.iloc[-1]
-        gateway_value = received_by(latest, names)
-        gateway_sub = node_hex(latest["gateway_id"]) if pd.notna(latest["gateway_id"]) else ""
         over_air = radio.dropna(subset=["rx_rssi"])
         if not over_air.empty:
             last = over_air.iloc[-1]
@@ -373,11 +403,19 @@ def status_strip(water, weather, status, names, node):
             link_sub = f"SNR {last['rx_snr']:.1f} dB · {int(last['hops']) if pd.notna(last['hops']) else '?'} hop(s)"
 
     cards([
-        ("Nodes online", f"{online} / {len(seen)}", "heard in the last 5 min"),
-        ("Last data", time_ago(newest), clock(newest)),
-        ("Received by", gateway_value, gateway_sub),
+        ("Plugged in (USB)", display_name(plugged, names) if plugged else "Nothing", node_hex(plugged) if plugged else "no base station connected"),
+        ("Nodes on", f"{on} / {len(members)}", "heard on the radio in the last 10 min"),
+        ("Last sensor data", time_ago(newest), clock(newest)),
         ("Latest link", link_value, link_sub),
     ])
+
+
+def swarm_members(water, weather, plugged):
+    members = set(water["node_id"].dropna().astype(int)) | set(weather["node_id"].dropna().astype(int))
+    members |= set(water["gateway_id"].dropna().astype(int)) | set(weather["gateway_id"].dropna().astype(int))
+    if plugged:
+        members.add(plugged)
+    return sorted(members)
 
 
 def latest_row(df, columns):
@@ -416,11 +454,12 @@ def sonde_alerts(water, names):
             st.warning(f"Sonde on {display_name(node_id, names)} is not responding (last attempt {clock(last['timestamp'])}).")
 
 
-def network_table(water, weather, status, names):
+def network_table(water, weather, status, names, presence):
+    plugged, radio_heard = presence
     gateways = set(water["gateway_id"].dropna().astype(int)) | set(weather["gateway_id"].dropna().astype(int))
-    seen = last_seen(water, weather, status)
+    seen = last_seen(water, weather, status, radio_heard)
     rows = []
-    for node_id in sorted(set(water["node_id"]) | set(weather["node_id"]) | gateways):
+    for node_id in swarm_members(water, weather, plugged):
         group = water[water["node_id"] == node_id]
         radio = pd.concat([group, weather[weather["node_id"] == node_id]]).dropna(subset=["rx_rssi"]).sort_values("timestamp")
         node_status = status[status["node_id"] == node_id]
@@ -434,12 +473,12 @@ def network_table(water, weather, status, names):
         role = "Sensor + base" if sensor and node_id in gateways else "Sensor" if sensor else "Base station"
         heard = seen.get(node_id)
         rows.append({
-            "Status": "Online" if heard is not None and datetime.now() - heard < ONLINE_WINDOW else "Offline",
+            "Status": presence_label(node_id, heard, plugged),
             "Node": display_name(node_id, names),
             "Node ID": node_hex(node_id),
             "Hardware": names.get(int(node_id), (None, None))[1] or "—",
             "Role": role,
-            "Last Heard": time_ago(heard) if heard is not None else "—",
+            "Last Heard": "now" if node_id == plugged else time_ago(heard) if heard is not None else "—",
             "Delivery %": delivery_ratio(group["seq"]) if not group.empty else None,
             "RSSI dBm": radio["rx_rssi"].iloc[-1] if not radio.empty else None,
             "SNR dB": radio["rx_snr"].iloc[-1] if not radio.empty else None,
@@ -545,6 +584,7 @@ with st.sidebar:
 @st.fragment(run_every="5s")
 def live_view(view, node, metric_key, window_label, include_simulated, choices):
     names = load_names()
+    presence = load_presence()
     water, weather, status, invalid = load_data(include_simulated)
     if water.empty and weather.empty:
         st.info("No data received yet. Start the receiver with `./dashboard.sh start` and power a sensor node.")
@@ -559,7 +599,7 @@ def live_view(view, node, metric_key, window_label, include_simulated, choices):
     table, column, label, unit, decimals = metric_spec(metric_key)
 
     if view == "Overview":
-        status_strip(water, weather, status, names, node)
+        status_strip(water, weather, status, names, node, presence)
         sonde_alerts(water_now, names)
         left, right = st.columns(2, gap="medium")
         with left:
@@ -605,8 +645,8 @@ def live_view(view, node, metric_key, window_label, include_simulated, choices):
                     line_chart(weather_win, c, f"{name} ({unit_c})", names)
 
     elif view == "Network":
-        status_strip(water, weather, status, names, node)
-        network_table(water_now, weather_now, status, names)
+        status_strip(water, weather, status, names, node, presence)
+        network_table(water_now, weather_now, status, names, presence)
         radio = pd.concat([water_win, weather_win]).dropna(subset=["rx_rssi"]).sort_values("timestamp")
         if radio.empty:
             st.caption("No over-the-air packets in this time range (USB readings carry no signal strength).")

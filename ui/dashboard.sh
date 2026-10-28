@@ -18,6 +18,7 @@ mkdir -p "$LOG_DIR"
 pid_of() {
     case "$1" in
     receiver) pgrep -f "[Pp]ython.* receiver\.py" | head -1 || true ;;
+    supervisor) pgrep -f "dashboard\.sh _supervise" | head -1 || true ;;
     dashboard) pgrep -f "streamlit run app.py" | head -1 || true ;;
     esac
 }
@@ -37,41 +38,34 @@ meshtastic_ports() {
 
 start_receiver() {
     local port="${1:-}"
-    if [ -n "$(pid_of receiver)" ]; then
+    if [ -n "$(pid_of supervisor)" ]; then
         echo "Receiver already running (pid $(pid_of receiver))."
         return
     fi
     if [ -z "$port" ]; then
         local ports
         ports="$(meshtastic_ports)"
-        if [ -z "$ports" ]; then
-            echo "No Meshtastic node found on USB; starting the dashboard without live data."
-            echo "Plug in any node, then run: ./dashboard.sh restart"
-            return
-        fi
-        if [ "$(printf '%s\n' "$ports" | wc -l | tr -d ' ')" -gt 1 ]; then
+        if [ "$(printf '%s\n' "$ports" | grep -c .)" -gt 1 ]; then
             echo "Several Meshtastic nodes are plugged in. Pick the base station:"
             printf '  ./dashboard.sh start %s\n' $ports
             return
         fi
-        port="$ports"
     fi
-    if lsof "$port" >/dev/null 2>&1; then
+    if [ -n "$port" ] && lsof "$port" >/dev/null 2>&1; then
         echo "$port is in use by another program. Close the Meshtastic app or serial monitor, then retry:"
         lsof "$port" | tail -n +2
         return
     fi
-    nohup .venv/bin/python -u receiver.py --port "$port" >"$LOG_DIR/receiver.log" 2>&1 &
-    for _ in $(seq 1 40); do
-        grep -q "Waiting for data" "$LOG_DIR/receiver.log" 2>/dev/null && break
-        kill -0 $! 2>/dev/null || break
+    # The supervisor restarts the receiver if it ever exits; the receiver itself waits for a board to be plugged in.
+    nohup "$PWD/dashboard.sh" _supervise "$port" >"$LOG_DIR/receiver.log" 2>&1 &
+    for _ in $(seq 1 30); do
+        grep -qE "Waiting for data|not reachable" "$LOG_DIR/receiver.log" 2>/dev/null && break
         sleep 0.5
     done
-    if kill -0 $! 2>/dev/null; then
-        echo "Receiver started: $(grep -m1 'Base station' "$LOG_DIR/receiver.log" || echo "connecting on $port")"
+    if grep -q "Waiting for data" "$LOG_DIR/receiver.log" 2>/dev/null; then
+        echo "Receiver started: $(grep -m1 'Base station:' "$LOG_DIR/receiver.log")"
     else
-        echo "Receiver failed to start; see ui/$LOG_DIR/receiver.log:"
-        tail -5 "$LOG_DIR/receiver.log"
+        echo "Receiver started; no Meshtastic board on USB yet. Plug one in and it connects automatically."
     fi
 }
 
@@ -109,6 +103,14 @@ stop_one() {
     echo "$name stopped."
 }
 
+stop_receiver() {
+    # Stop the supervisor first so it doesn't restart the receiver we're about to stop.
+    local supervisor
+    supervisor="$(pid_of supervisor)"
+    if [ -n "$supervisor" ]; then kill -TERM "$supervisor" 2>/dev/null || true; fi
+    stop_one receiver
+}
+
 status() {
     local name pid
     for name in receiver dashboard; do
@@ -129,17 +131,26 @@ start)
     start_dashboard
     ;;
 stop)
-    stop_one receiver
+    stop_receiver
     stop_one dashboard
     ;;
 restart)
-    stop_one receiver
+    stop_receiver
     stop_one dashboard
     ensure_venv
     start_receiver "${2:-}"
     start_dashboard no-open
     ;;
 status) status ;;
+_supervise)
+    # The receiver exiting non-zero must not end this loop.
+    set +e
+    while true; do
+        .venv/bin/python -u receiver.py ${2:+--port "$2"}
+        echo "Receiver exited (code $?); restarting in 3 s"
+        sleep 3
+    done
+    ;;
 logs) tail -f "$LOG_DIR/receiver.log" "$LOG_DIR/dashboard.log" ;;
 *)
     sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
